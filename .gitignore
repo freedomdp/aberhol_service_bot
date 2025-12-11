@@ -1,0 +1,31 @@
+# Virtual Environment
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Mac OS
+.DS_Store
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.so
+
+# Media files
+media/
