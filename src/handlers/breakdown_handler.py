@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 from ..models.application import Application
 from ..utils.validators import validate_phone
-from ..utils.messages import REQUEST_ORDER, REQUEST_NAME, REQUEST_PHONE, REQUEST_PRINTER_MODEL, REQUEST_ISSUE_DESCRIPTION, REQUEST_PHOTO
+from ..utils.messages import REQUEST_ORDER, REQUEST_NAME, REQUEST_PHONE, REQUEST_EMAIL, REQUEST_PRINTER_MODEL, REQUEST_ISSUE_DESCRIPTION, REQUEST_PHOTO
 from ..keyboards.reply import remove_keyboard, get_main_keyboard, get_skip_reply_keyboard, get_next_reply_keyboard, get_confirm_reply_keyboard
 from .commands import active_applications
 
@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
     BD_WAITING_ORDER_NUMBER,
     BD_WAITING_NAME,
     BD_WAITING_PHONE,
+    BD_WAITING_EMAIL,           # Новий стан для введення email
     BD_WAITING_PRINTER_SERIES,  # Новий стан для вибору серії
     BD_WAITING_PRINTER_MODEL,   # Стан для вибору конкретної моделі
     BD_WAITING_DESCRIPTION,
     BD_WAITING_PHOTOS,
     BD_CONFIRMING,
-) = range(9)
+) = range(10)
 
 
 async def start_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -209,24 +210,51 @@ async def get_breakdown_phone(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     app = active_applications[user_id]
     
+    # Після телефону завжди переходимо до введення email
+    success, message, _ = await UniversalPhoneInput.process(
+        update, context, app, next_message=REQUEST_EMAIL, next_state=BD_WAITING_EMAIL
+    )
+    
+    if not success:
+        await update.message.reply_text(message)
+        return BD_WAITING_PHONE
+    
+    await update.message.reply_text(message)
+    context.user_data['breakdown_state'] = BD_WAITING_EMAIL
+    logger.info("Перехід до BD_WAITING_EMAIL")
+    return BD_WAITING_EMAIL
+
+
+async def get_breakdown_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отримання email адреси (використовує універсальний компонент)"""
+    user_id = update.effective_user.id
+    
+    if user_id not in active_applications:
+        await update.message.reply_text("❌ Помилка. Будь ласка, почніть знову.")
+        return ConversationHandler.END
+    
+    from ..components import UniversalEmailInput
+    
+    app = active_applications[user_id]
+    
     # Визначаємо наступне повідомлення та стан залежно від наявності номера замовлення
     if not app.order_number:
         next_message = REQUEST_PRINTER_MODEL
         next_state = BD_WAITING_PRINTER_SERIES
         use_keyboard = True
     else:
-        # Якщо є номер замовлення, після телефону переходимо до фото/відео
+        # Якщо є номер замовлення, після email переходимо до фото/відео
         next_message = REQUEST_PHOTO
         next_state = BD_WAITING_PHOTOS
         use_keyboard = False
     
-    success, message, _ = await UniversalPhoneInput.process(
+    success, message, _ = await UniversalEmailInput.process(
         update, context, app, next_message=next_message, next_state=next_state
     )
     
     if not success:
         await update.message.reply_text(message)
-        return BD_WAITING_PHONE
+        return BD_WAITING_EMAIL
     
     if use_keyboard:
         from ..keyboards.reply import get_printer_series_reply_keyboard
@@ -234,13 +262,12 @@ async def get_breakdown_phone(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(message, reply_markup=get_printer_series_reply_keyboard())
         logger.info("Перехід до BD_WAITING_PRINTER_SERIES")
     else:
-        # Після телефону переходимо до фото/відео (показуємо "Пропустити", бо файлів ще немає)
-        # UniversalPhoneInput.process() вже додав REQUEST_PHOTO до message, тому не додаємо повторно
+        # Після email переходимо до фото/відео (показуємо "Пропустити", бо файлів ще немає)
         from ..keyboards.reply import get_skip_reply_keyboard
         context.user_data['breakdown_state'] = BD_WAITING_PHOTOS
         await update.message.reply_text(
-            message,  # message вже містить підтвердження телефону + REQUEST_PHOTO
-            reply_markup=get_skip_reply_keyboard()  # Показуємо "Пропустити", бо файлів ще немає
+            message,
+            reply_markup=get_skip_reply_keyboard()
         )
         logger.info("Перехід до BD_WAITING_PHOTOS")
     
@@ -569,6 +596,7 @@ async def skip_breakdown_photos(update: Update, context: ContextTypes.DEFAULT_TY
 async def confirm_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Підтвердження та відправка заявки інженеру (через ReplyKeyboard)"""
     import os
+    import asyncio
     
     user_id = update.effective_user.id
     message_text = update.message.text if update.message else "N/A"
@@ -615,38 +643,45 @@ async def confirm_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     try:
         recipient_id = int(recipient_id)
+
+        # Запам'ятовуємо, куди відправляємо (для ретраїв)
+        app.engineer_chat_id = recipient_id
         
-        # Відправляємо заявку інженеру
-        message_text = app.to_message()
-        message_text = message_text.replace("📋 <b>Нова заявка на сервісне обслуговування</b>", 
-                                           "📋 <b>Нова заявка: 🔧 Поломка</b>")
+        # Відправляємо текст заявки інженеру ОДИН раз (щоб ретраї не дублювали summary)
+        if not app.engineer_summary_message_id:
+            engineer_message_text = app.to_message()
+            engineer_message_text = engineer_message_text.replace(
+                "📋 <b>Нова заявка на сервісне обслуговування</b>",
+                "📋 <b>Нова заявка: 🔧 Поломка</b>"
+            )
+            sent_msg = await context.bot.send_message(
+                chat_id=recipient_id,
+                text=engineer_message_text,
+                parse_mode='HTML'
+            )
+            app.engineer_summary_message_id = getattr(sent_msg, "message_id", None)
+
+        # Надійно доставляємо медіа інженеру: копіюємо оригінальні повідомлення користувача
+        logger.info(f"confirm_breakdown: media_messages={len(app.media_messages)}, photo_file_ids={len(app.photo_file_ids)}")
         
-        await context.bot.send_message(
-            chat_id=recipient_id,
-            text=message_text,
-            parse_mode='HTML'
-        )
+        pending_media = [m for m in app.media_messages if m.get("message_id") not in app.media_messages_sent]
+        media_sent_to_engineer = False
         
-        # Відправляємо фото/відео якщо є
-        if app.photo_file_ids:
+        # Fallback: якщо media_messages не збережені (старий код або помилка), використовуємо send_media_group
+        if not pending_media and app.photo_file_ids:
+            logger.warning(f"media_messages порожній, але є {len(app.photo_file_ids)} photo_file_ids. Використовуємо fallback (send_media_group) для інженера")
             media_group = []
             for i, photo_id in enumerate(app.photo_file_ids[:10]):
-                # Використовуємо збережений тип файлу, якщо він є
                 if i < len(app.photo_file_types):
                     media_type = app.photo_file_types[i]
                 else:
-                    # Fallback: визначаємо тип по префіксу file_id
-                    # Для фото file_id обычно начинается с 'AgAC', для видео - 'BAAC' или 'CAA'
-                    media_type = 'photo'  # По умолчанию фото
-                    if not photo_id.startswith('AgAC'):
-                        media_type = 'video'
+                    media_type = 'photo' if photo_id.startswith('AgAC') else 'video'
                 
                 media_group.append({
                     'type': media_type,
                     'media': photo_id
                 })
             
-            # Розділяємо на групи по 10 файлів
             for i in range(0, len(media_group), 10):
                 group = media_group[i:i+10]
                 try:
@@ -654,8 +689,92 @@ async def confirm_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         chat_id=recipient_id,
                         media=group
                     )
+                    logger.info(f"✅ Відправлено {len(group)} медіа інженеру через send_media_group (fallback)")
+                    media_sent_to_engineer = True
                 except Exception as e:
-                    logger.error(f"Помилка при відправці медіа: {e}")
+                    logger.error(f"❌ Помилка при відправці медіа інженеру через fallback: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        f"❌ Не вдалося переслати файли інженеру. Спробуйте підтвердити ще раз.",
+                        reply_markup=get_confirm_reply_keyboard()
+                    )
+                    return BD_CONFIRMING
+        
+        elif pending_media:
+            logger.info(f"Копіюємо {len(pending_media)} медіа інженеру через copy_message")
+            failed = []
+            for m in pending_media:
+                from_chat_id = int(m["chat_id"])
+                msg_id = int(m["message_id"])
+                ok = False
+                last_err = None
+                for delay in (0.0, 0.8, 1.6):
+                    try:
+                        if delay:
+                            await asyncio.sleep(delay)
+                        await context.bot.copy_message(
+                            chat_id=recipient_id,
+                            from_chat_id=from_chat_id,
+                            message_id=msg_id
+                        )
+                        app.media_messages_sent.add(msg_id)
+                        ok = True
+                        logger.info(f"✅ Успішно скопійовано медіа інженеру message_id={msg_id}")
+                        media_sent_to_engineer = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(f"Помилка при копіюванні медіа message_id={msg_id} (спроба з затримкою {delay}s): {e}")
+
+            if failed:
+                remaining = len([m for m in app.media_messages if m.get("message_id") not in app.media_messages_sent])
+                logger.error(f"❌ Не вдалося переслати {len(failed)} медіа інженеру. Залишилось: {remaining}. Помилки: {[str(e) for _, e in failed]}")
+                
+                # Fallback: якщо copy_message не спрацював, пробуємо send_media_group
+                if app.photo_file_ids:
+                    logger.warning(f"Пробуємо fallback через send_media_group для {len(app.photo_file_ids)} файлів")
+                    try:
+                        media_group = []
+                        for i, photo_id in enumerate(app.photo_file_ids[:10]):
+                            if i < len(app.photo_file_types):
+                                media_type = app.photo_file_types[i]
+                            else:
+                                media_type = 'photo' if photo_id.startswith('AgAC') else 'video'
+                            
+                            media_group.append({
+                                'type': media_type,
+                                'media': photo_id
+                            })
+                        
+                        await context.bot.send_media_group(
+                            chat_id=recipient_id,
+                            media=media_group
+                        )
+                        logger.info(f"✅ Відправлено {len(media_group)} медіа інженеру через send_media_group (fallback після помилки copy_message)")
+                        media_sent_to_engineer = True
+                    except Exception as fallback_err:
+                        logger.error(f"❌ Fallback також не спрацював: {fallback_err}")
+                        await update.message.reply_text(
+                            f"❌ Не вдалося переслати всі файли інженеру. Залишилось: {remaining}.\n"
+                            f"Будь ласка, натисніть підтвердження ще раз — бот повторить відправку файлів.",
+                            reply_markup=get_confirm_reply_keyboard()
+                        )
+                        return BD_CONFIRMING
+                else:
+                    await update.message.reply_text(
+                        f"❌ Не вдалося переслати всі файли інженеру. Залишилось: {remaining}.\n"
+                        f"Будь ласка, натисніть підтвердження ще раз — бот повторить відправку файлів.",
+                        reply_markup=get_confirm_reply_keyboard()
+                    )
+                    return BD_CONFIRMING
+        
+        # Перевіряємо, що медіа були відправлені інженеру
+        if app.photo_file_ids and not media_sent_to_engineer:
+            logger.error(f"❌ КРИТИЧНА ПОМИЛКА: Є {len(app.photo_file_ids)} photo_file_ids, але медіа не були відправлені інженеру!")
+            await update.message.reply_text(
+                f"❌ Помилка: файли не були відправлені інженеру. Будь ласка, спробуйте підтвердити ще раз.",
+                reply_markup=get_confirm_reply_keyboard()
+            )
+            return BD_CONFIRMING
         
         # Формуємо фінальне повідомлення з повною інформацією про заявку
         full_message = app.to_message()
@@ -673,12 +792,99 @@ async def confirm_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Дякуємо за звернення! 🙏"
         )
         
-        # Відправляємо одне фінальне повідомлення з усією інформацією
+        # Відправляємо текст клієнту
         await update.message.reply_text(
             full_message + success_message,
             parse_mode='HTML',
             reply_markup=get_main_keyboard()
         )
+        
+        # ВАЖЛИВО: Показуємо клієнту його файли, щоб він бачив, що вони прикріплені
+        user_chat_id = update.effective_chat.id
+        client_media_to_show = app.media_messages if app.media_messages else []
+        
+        # Якщо media_messages порожній, але є photo_file_ids, створюємо тимчасові посилання для показу
+        if not client_media_to_show and app.photo_file_ids:
+            logger.info(f"Для клієнта: media_messages порожній, але є {len(app.photo_file_ids)} photo_file_ids. Відправляємо через send_media_group")
+            try:
+                media_group = []
+                for i, photo_id in enumerate(app.photo_file_ids[:10]):
+                    if i < len(app.photo_file_types):
+                        media_type = app.photo_file_types[i]
+                    else:
+                        media_type = 'photo' if photo_id.startswith('AgAC') else 'video'
+                    
+                    media_group.append({
+                        'type': media_type,
+                        'media': photo_id
+                    })
+                
+                if media_group:
+                    # Відправляємо перше фото/відео з caption (текст заявки)
+                    first_media = media_group[0]
+                    caption = full_message + success_message
+                    if first_media['type'] == 'photo':
+                        await context.bot.send_photo(
+                            chat_id=user_chat_id,
+                            photo=first_media['media'],
+                            caption=caption[:1024],  # Telegram limit
+                            parse_mode='HTML'
+                        )
+                    else:
+                        await context.bot.send_video(
+                            chat_id=user_chat_id,
+                            video=first_media['media'],
+                            caption=caption[:1024],
+                            parse_mode='HTML'
+                        )
+                    
+                    # Решту відправляємо без caption
+                    if len(media_group) > 1:
+                        await context.bot.send_media_group(
+                            chat_id=user_chat_id,
+                            media=media_group[1:10]
+                        )
+            except Exception as e:
+                logger.error(f"Помилка при відправці медіа клієнту: {e}")
+        elif client_media_to_show:
+            # Копіюємо оригінальні повідомлення клієнту, щоб він бачив свої файли
+            logger.info(f"Копіюємо {len(client_media_to_show)} медіа клієнту для перегляду")
+            for m in client_media_to_show[:10]:  # Обмежуємо до 10 файлів
+                try:
+                    from_chat_id = int(m["chat_id"])
+                    msg_id = int(m["message_id"])
+                    await context.bot.copy_message(
+                        chat_id=user_chat_id,
+                        from_chat_id=from_chat_id,
+                        message_id=msg_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Не вдалося скопіювати медіа клієнту message_id={msg_id}: {e}")
+        
+        # Отправляем заявку в KeyCRM через API (асинхронно, не блокируем ответ пользователю)
+        from ..services.context import get_keycrm_service
+        keycrm_service = get_keycrm_service()
+        if keycrm_service:
+            try:
+                # Отправляем заявку в KeyCRM в фоне (не ждем результата)
+                import asyncio
+                async def send_to_keycrm_with_logging():
+                    """Обертка для логирования результата отправки в KeyCRM"""
+                    try:
+                        card_id = await keycrm_service.create_card(app, context.bot)
+                        if card_id:
+                            logger.info(f"✅ Заявка успешно создана в KeyCRM (card_id={card_id}) для пользователя {user_id}")
+                        else:
+                            logger.error(f"❌ Не удалось создать заявку в KeyCRM для пользователя {user_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при отправке заявки в KeyCRM для пользователя {user_id}: {e}", exc_info=True)
+                
+                asyncio.create_task(send_to_keycrm_with_logging())
+                logger.info(f"Запущена отправка заявки в KeyCRM для пользователя {user_id}")
+            except Exception as e:
+                logger.error(f"Ошибка при запуске отправки в KeyCRM: {e}", exc_info=True)
+        else:
+            logger.warning("KeyCRMService не инициализирован. Заявка в KeyCRM не будет отправлена.")
         
         # Отменяем напоминания
         from ..services.context import get_reminder_service
@@ -731,6 +937,7 @@ def get_breakdown_conversation_handler() -> ConversationHandler:
             BD_WAITING_ORDER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_breakdown_order)],
             BD_WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_breakdown_name)],
             BD_WAITING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_breakdown_phone)],
+            BD_WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_breakdown_email)],
             BD_WAITING_PRINTER_SERIES: [
                 MessageHandler(filters.TEXT & filters.Regex("^(Серія A|Серія P|Серія X|Серія H|Інший виробник)$"), get_breakdown_printer_series),
             ],

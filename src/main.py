@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-Головний файл Telegram бота для сервісного центру Bambu Lab Україна
+Минимальный Telegram бот для интеграции с KeyCRM
+Бот работает напрямую с CRM, операторы общаются с клиентами через CRM
 """
 import os
 import logging
 from dotenv import load_dotenv
-from telegram.ext import Application
-
-from src.handlers import register_commands, register_conversation_handlers
-from src.services import MediaStorage, ErrorHandler, ReminderService
-from src.services.context import (
-    set_media_storage, set_error_handler, set_reminder_service
-)
+from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 # Налаштування логування
 import logging.handlers
@@ -51,12 +46,66 @@ root_logger.setLevel(logging.INFO)
 root_logger.addHandler(console_handler)
 root_logger.addHandler(file_handler)
 
+# ВАЖНО: не даём библиотечным HTTP-логерам печатать URL с токеном бота
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 logger.info(f"Логування налаштовано. Файл логів: {log_file}")
 
 
+async def start_command(update, context):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    logger.info(f"Команда /start от пользователя {user.id} ({user.first_name})")
+    
+    welcome_text = (
+        "👋 Вітаємо!\n\n"
+        "Цей бот інтегрований з KeyCRM.\n"
+        "Оператори будуть спілкуватися з вами через CRM систему.\n\n"
+        "Просто надішліть ваше повідомлення, і ми відповімо найближчим часом."
+    )
+    
+    await update.message.reply_text(welcome_text)
+
+
+async def handle_message(update, context):
+    """Обработчик всех сообщений от пользователей"""
+    user = update.effective_user
+    message = update.message
+    
+    if not message:
+        return
+    
+    # Логируем сообщение
+    logger.info(
+        f"Сообщение от пользователя {user.id} ({user.first_name}): "
+        f"text='{message.text}', message_id={message.message_id}"
+    )
+    
+    # Если есть медиа (фото, видео, документ)
+    if message.photo:
+        logger.info(f"Получено фото от пользователя {user.id}")
+        # KeyCRM будет обрабатывать медиа через webhook
+    elif message.video:
+        logger.info(f"Получено видео от пользователя {user.id}")
+    elif message.document:
+        logger.info(f"Получен документ от пользователя {user.id}: {message.document.file_name}")
+    
+    # KeyCRM управляет ботом напрямую через webhook
+    # Здесь мы только логируем входящие сообщения
+    # Ответы будут приходить из KeyCRM через webhook
+
+
+async def handle_error(update, context):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"Ошибка при обработке update: {context.error}", exc_info=context.error)
+
+
 def main() -> None:
-    """Головна функція для запуску бота"""
+    """Главная функция для запуска бота"""
     # Завантажуємо змінні оточення
     load_dotenv()
 
@@ -65,95 +114,31 @@ def main() -> None:
     if not token:
         raise ValueError("TELEGRAM_TOKEN не встановлено в змінних оточення")
 
-    # Инициализируем сервисы
-    media_storage = MediaStorage(
-        storage_path=os.getenv('MEDIA_STORAGE_PATH', './media'),
-        base_url=os.getenv('BASE_URL', 'http://localhost:8000')
-    )
+    # Створюємо додаток
+    application = Application.builder().token(token).build()
     
-    error_handler = ErrorHandler()
+    # Реєструємо обробники
+    logger.info("Реєстрація обробників...")
     
-    # Создаем временный bot для ReminderService (будет заменен после создания application)
-    from telegram import Bot
-    temp_bot = Bot(token=token)
-    reminder_service = ReminderService(bot=temp_bot)
+    # Команда /start
+    application.add_handler(CommandHandler("start", start_command))
     
-    # Устанавливаем сервисы в контекст для доступа из обработчиков
-    set_media_storage(media_storage)
-    set_error_handler(error_handler)
-    set_reminder_service(reminder_service)
+    # Обработчик всех сообщений (текст, фото, видео, документы)
+    application.add_handler(MessageHandler(filters.ALL, handle_message))
     
-    # Создаем post_init callback для запуска ReminderService после создания event loop
-    async def post_init(app: Application) -> None:
-        """Вызывается после создания event loop"""
-        # Обновляем bot в reminder_service на реальный
-        reminder_service.bot = app.bot
-        reminder_service.start()
-        logger.info("ReminderService запущен")
-    
-    # Створюємо додаток з post_init callback
-    application = Application.builder().token(token).post_init(post_init).build()
-    
-    # Реєструємо обробники (важливо: команды регистрируются ПЕРВЫМИ)
-    # Реєструємо обробник callback для FAQ (використовуємо InlineKeyboard для FAQ)
-    from telegram.ext import CallbackQueryHandler
-    from src.handlers.commands import handle_faq_repair
-    
-    logger.info("Реєстрація обробника callback FAQ (faq_repair)...")
-    application.add_handler(
-        CallbackQueryHandler(handle_faq_repair, pattern="^faq_repair$"),
-        group=-1  # Високий пріоритет (обробляється перед ConversationHandler)
-    )
-    
-    logger.info("ВАЖЛИВО: Для breakdown використовуємо ReplyKeyboard, обробка через ConversationHandler")
-    
-    logger.info("Реєстрація обробників команд...")
-    register_commands(application)
-    
-    # Потім реєструємо ConversationHandler (нижчий пріоритет)
-    logger.info("Реєстрація обробників розмов...")
-    register_conversation_handlers(application)
-    
-    # Реєструємо обробники для розділів "Поломка" та "Якість друку"
-    from src.handlers.breakdown_handler import get_breakdown_conversation_handler
-    from src.handlers.quality_handler import get_quality_conversation_handler
-    
-    logger.info("Реєстрація обробника розділу '🔧 Поломка'")
-    application.add_handler(get_breakdown_conversation_handler())
-    
-    logger.info("Реєстрація обробника розділу '🖨 Якість друку'")
-    application.add_handler(get_quality_conversation_handler())
-    
-    # Добавляем максимально подробное логирование всех update'ов
-    from telegram import Update
-    from telegram.ext import ContextTypes, CallbackQueryHandler as CQH, MessageHandler, filters
-    
-    async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Логирует все входящие update'ы для диагностики"""
-        if update.message:
-            logger.info(f"[UPDATE DEBUG] MESSAGE: user_id={update.effective_user.id}, chat_id={update.effective_chat.id}, text='{update.message.text}', message_id={update.message.message_id}")
-        elif update.callback_query:
-            logger.info(f"[UPDATE DEBUG] CALLBACK QUERY: user_id={update.effective_user.id}, chat_id={update.effective_chat.id}, data='{update.callback_query.data}', message_id={update.callback_query.message.message_id if update.callback_query.message else 'N/A'}")
-        else:
-            logger.info(f"[UPDATE DEBUG] OTHER UPDATE: {update}")
-    
-    application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-2) # Самый низкий приоритет
-    application.add_handler(CQH(log_all_updates), group=-2) # Логирование callback queries
-    
-    # Регистрируем глобальный обработчик ошибок
-    application.add_error_handler(error_handler.handle_error)
+    # Глобальный обработчик ошибок
+    application.add_error_handler(handle_error)
     
     # Запускаємо бота
     logger.info("Бот запущено...")
-    logger.info("Очікування повідомлень від користувачів...")
+    logger.info("Бот готов к работе с KeyCRM через webhook")
+    logger.info("KeyCRM будет управлять ботом напрямую")
     
     try:
         application.run_polling()
     except KeyboardInterrupt:
         logger.info("Остановка бота...")
     finally:
-        # Останавливаем сервисы
-        reminder_service.stop()
         logger.info("Бот остановлен")
 
 

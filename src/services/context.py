@@ -5,11 +5,13 @@ from typing import Optional
 from .media_storage import MediaStorage
 from .error_handler import ErrorHandler
 from .reminder_service import ReminderService
+from .keycrm_service import KeyCRMService
 
 # Глобальные экземпляры сервисов
 _media_storage: Optional[MediaStorage] = None
 _error_handler: Optional[ErrorHandler] = None
 _reminder_service: Optional[ReminderService] = None
+_keycrm_service: Optional[KeyCRMService] = None
 
 
 def set_media_storage(storage: MediaStorage):
@@ -43,4 +45,15 @@ def set_reminder_service(service: ReminderService):
 def get_reminder_service() -> Optional[ReminderService]:
     """Возвращает экземпляр ReminderService"""
     return _reminder_service
+
+
+def set_keycrm_service(service: KeyCRMService):
+    """Устанавливает экземпляр KeyCRMService"""
+    global _keycrm_service
+    _keycrm_service = service
+
+
+def get_keycrm_service() -> Optional[KeyCRMService]:
+    """Возвращает экземпляр KeyCRMService"""
+    return _keycrm_service
 

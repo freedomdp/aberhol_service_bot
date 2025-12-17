@@ -93,6 +93,21 @@ class UniversalPhotoUpload:
         
         else:
             return False, "❌ Будь ласка, надішліть фото або відео, або натисніть 'Пропустити':", False
+
+        # Зберігаємо посилання на оригінальне повідомлення користувача для надійної доставки інженеру (copy_message)
+        try:
+            if update.effective_chat and update.message:
+                chat_id = int(update.effective_chat.id)
+                message_id = int(update.message.message_id)
+                ref = {"chat_id": chat_id, "message_id": message_id}
+                # Перевіряємо, чи це повідомлення вже збережено (по message_id)
+                existing_ids = {m.get("message_id") for m in application.media_messages}
+                if message_id not in existing_ids and len(application.photo_file_ids) < max_files:
+                    application.media_messages.append(ref)
+                    logger.info(f"Збережено media_message: chat_id={chat_id}, message_id={message_id}, всього: {len(application.media_messages)}")
+        except Exception as e:
+            # Не ламаємо flow, якщо не змогли зберегти референс, але логуємо помилку
+            logger.warning(f"Не вдалося зберегти media_message: {e}", exc_info=True)
         
         # Зберігаємо file_id та тип файлу
         application.photo_file_ids.append(file_id)
@@ -140,6 +155,7 @@ class UniversalPhotoUpload:
         # Обробляємо поточний файл
         file_id = None
         file_type = None
+        message_id = update.message.message_id
         
         if update.message.photo:
             photo = update.message.photo[-1]  # Беремо найбільше фото
@@ -151,6 +167,14 @@ class UniversalPhotoUpload:
             file_type = 'video'
         else:
             return False, "❌ Невідомий тип файлу в медіа-групі", False
+
+        # Ініціалізуємо структури для відстеження message_id медіа-групи (для copy_message)
+        if 'media_group_message_ids' not in context.user_data:
+            context.user_data['media_group_message_ids'] = {}  # {media_group_id: [message_id]}
+        if media_group_id not in context.user_data['media_group_message_ids']:
+            context.user_data['media_group_message_ids'][media_group_id] = []
+        if message_id not in context.user_data['media_group_message_ids'][media_group_id]:
+            context.user_data['media_group_message_ids'][media_group_id].append(message_id)
         
         # Перевіряємо, чи цей файл вже оброблено
         if file_id in context.user_data['media_groups'][media_group_id]:
@@ -163,6 +187,20 @@ class UniversalPhotoUpload:
         # Зберігаємо файл, якщо не досягли максимуму
         file_was_added = False
         if len(application.photo_file_ids) < max_files:
+            # Зберігаємо посилання на оригінальне повідомлення користувача для надійної доставки інженеру (copy_message)
+            try:
+                if update.effective_chat and update.message:
+                    chat_id = int(update.effective_chat.id)
+                    msg_id = int(update.message.message_id)
+                    ref = {"chat_id": chat_id, "message_id": msg_id}
+                    # Перевіряємо, чи це повідомлення вже збережено (по message_id)
+                    existing_ids = {m.get("message_id") for m in application.media_messages}
+                    if msg_id not in existing_ids:
+                        application.media_messages.append(ref)
+                        logger.info(f"Збережено media_message з медіа-групи: chat_id={chat_id}, message_id={msg_id}, всього: {len(application.media_messages)}")
+            except Exception as e:
+                logger.warning(f"Не вдалося зберегти media_message з медіа-групи: {e}", exc_info=True)
+
             application.photo_file_ids.append(file_id)
             application.photo_file_types.append(file_type)
             file_was_added = True
